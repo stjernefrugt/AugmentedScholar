@@ -7,7 +7,9 @@ from unittest.mock import MagicMock
 from src.ss_client import SemanticScholarClient
 
 
-def _make_client(responses: list[dict[str, object]]) -> tuple[SemanticScholarClient, MagicMock]:
+def _make_client(
+    responses: list[dict[str, object]],
+) -> tuple[SemanticScholarClient, MagicMock]:
     """Build a SemanticScholarClient with a mock httpx.Client.
 
     Args:
