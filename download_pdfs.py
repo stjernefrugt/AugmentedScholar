@@ -156,7 +156,7 @@ def _run(
 
                 # Attempt auto-download via journal selectors
                 try:
-                    with context.expect_download(
+                    with page.expect_download(
                         timeout=_AUTO_DOWNLOAD_TIMEOUT * 1000
                     ) as dl_info:
                         page.goto(

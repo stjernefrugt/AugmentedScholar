@@ -1,0 +1,13 @@
+# Core ingestion pipeline
+pydantic>=2.0
+httpx>=0.25
+
+# Knowledge graph & visualisation
+networkx>=3.0
+pyvis>=0.3.2
+
+# ISO 4 journal title abbreviation
+pyiso4>=0.1.6
+
+# Google Scholar scraping (optional — only needed for --gscholar-url)
+scholarly>=1.7

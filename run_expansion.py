@@ -31,9 +31,11 @@ import sys
 from pathlib import Path
 
 from src.citation_explorer import CitationExplorer
+from src.enrichment import enrich_library
 from src.graph import CitationGraph
 from src.gscholar_client import GoogleScholarClient
 from src.ingest import IngestionPipeline
+from src.metadata_fetcher import MetadataFetcher
 from src.ss_client import SemanticScholarClient
 from src.unpaywall_client import UnpaywallClient
 
@@ -232,6 +234,22 @@ def main() -> None:
             "Use with download_pdfs.py for Playwright-assisted downloading."
         ),
     )
+    parser.add_argument(
+        "--enrich",
+        action="store_true",
+        help=(
+            "After expansion, fetch full metadata (abstract, citation count) "
+            "for any papers missing an abstract via DOI lookup. "
+            "Automatically enabled when --depth 0 is used with --gscholar-url."
+        ),
+    )
+    parser.add_argument(
+        "--enrich-delay",
+        type=float,
+        default=1.0,
+        metavar="SECS",
+        help="Seconds between enrichment API requests (default: 1.0)",
+    )
     args = parser.parse_args()
 
     if args.find_author:
@@ -295,6 +313,16 @@ def main() -> None:
     print(f"  Graph nodes    : {graph.graph.number_of_nodes()}")
     print(f"  Graph edges    : {graph.graph.number_of_edges()}")
     print(f"{divider}\n")
+
+    # Enrichment pass (auto-enabled for GS depth-0 runs)
+    run_enrich = args.enrich or (args.gscholar_url and args.depth == 0)
+    if run_enrich:
+        logger.info("Running metadata enrichment pass...")
+        fetcher = MetadataFetcher()
+        enriched, failed = enrich_library(library_dir, fetcher, delay=args.enrich_delay)
+        print(f"  Enriched       : {enriched} papers")
+        if failed:
+            logger.warning("Enrichment failed for %d paper(s)", failed)
 
     # Write missing-PDFs manifest
     manifest_path = Path(args.missing_pdfs)
