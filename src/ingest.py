@@ -20,6 +20,7 @@ from .metadata_fetcher import MetadataFetcher
 from .models import IngestionResult, PaperMetadata
 from .naming import build_stem, generate_filename
 from .pdf_handler import PDFHandler
+from .unpaywall_client import UnpaywallClient
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +50,12 @@ class IngestionPipeline:
         library_dir: Path,
         fetcher: MetadataFetcher | None = None,
         pdf_handler: PDFHandler | None = None,
+        unpaywall_client: UnpaywallClient | None = None,
     ) -> None:
         self.library_dir = library_dir
         self._fetcher: MetadataFetcher = fetcher or MetadataFetcher()
         self._pdf_handler: PDFHandler = pdf_handler or PDFHandler(library_dir)
+        self._unpaywall: UnpaywallClient | None = unpaywall_client
 
     # ------------------------------------------------------------------
     # Public API
@@ -91,7 +94,7 @@ class IngestionPipeline:
         )
 
         # --- 2. Resolve PDF URL -----------------------------------------
-        resolved_pdf_url = self._resolve_pdf_url(pdf_url, metadata)
+        resolved_pdf_url = self._resolve_pdf_url(pdf_url, metadata, doi)
 
         # --- 3. Derive filenames ----------------------------------------
         stem = build_stem(metadata)
@@ -138,7 +141,7 @@ class IngestionPipeline:
             Populated :class:`~src.models.IngestionResult`.
         """
         logger.info("Ingesting from metadata: %r (%d)", metadata.title, metadata.year)
-        resolved_pdf_url = self._resolve_pdf_url(pdf_url, metadata)
+        resolved_pdf_url = self._resolve_pdf_url(pdf_url, metadata, metadata.doi)
         stem = build_stem(metadata)
         pdf_path = self._maybe_download(resolved_pdf_url, generate_filename(metadata))
         si_path = self._maybe_download(si_url, generate_filename(metadata, is_si=True))
@@ -156,25 +159,34 @@ class IngestionPipeline:
     # Private helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _resolve_pdf_url(
+        self,
         explicit_url: str | None,
         metadata: PaperMetadata,
+        doi: str | None = None,
     ) -> str | None:
         """Determine the effective PDF URL to use.
 
-        An empty string is treated as an explicit "skip" signal.
+        Resolution order:
+        1. *explicit_url* — caller-supplied override (empty string = skip).
+        2. ``metadata.pdf_url`` — open-access URL from the metadata API.
+        3. Unpaywall — queried by DOI when no URL was found above.
 
         Args:
             explicit_url: Caller-supplied URL override.
             metadata: Metadata that may contain an open-access URL.
+            doi: DOI to pass to Unpaywall when other sources yield nothing.
 
         Returns:
             URL string to download, or ``None`` if no download should occur.
         """
         if explicit_url is not None:
             return explicit_url if explicit_url else None
-        return metadata.pdf_url
+        if metadata.pdf_url:
+            return metadata.pdf_url
+        if doi and self._unpaywall:
+            return self._unpaywall.get_pdf_url(doi)
+        return None
 
     def _maybe_download(self, url: str | None, filename: str) -> Path | None:
         """Download *url* to *filename* if *url* is not ``None``.
