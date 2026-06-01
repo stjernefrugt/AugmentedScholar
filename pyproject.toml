@@ -1,0 +1,19 @@
+[tool.ruff]
+# Enable pycodestyle (`E`) and Pyflakes (`F`) codes.
+lint.select = ["E", "F", "I", "UP", "B"]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+show_error_codes = true
+ignore_missing_imports = true # Set to false if you have stubs for all libs
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
