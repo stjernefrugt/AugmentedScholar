@@ -45,8 +45,9 @@ def abbreviate_journal(journal: str) -> str:
         'j-am-chem-soc'
     """
     raw: str = _abbr(journal.strip())
-    no_dots = raw.replace(".", "")
-    lowered = no_dots.lower()
+    # Remove dots, commas, colons — all produce invalid or ugly filename chars
+    clean = raw.replace(".", "").replace(",", "").replace(":", "")
+    lowered = clean.lower()
     hyphenated = re.sub(r"[\s&/()]+", "-", lowered)
     return re.sub(r"-+", "-", hyphenated).strip("-") or "unknown-journal"
 
