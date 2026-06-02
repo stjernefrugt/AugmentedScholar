@@ -20,6 +20,7 @@ import argparse as _argparse
 import sys
 from pathlib import Path
 
+import networkx as nx
 import streamlit as st
 
 _parser = _argparse.ArgumentParser(add_help=False)
@@ -60,9 +61,45 @@ def _get_positions(mtime: float) -> dict[str, tuple[float, float, float]]:
     return compute_layout_3d(cg.graph)  # type: ignore[arg-type]
 
 
-def _get_figure() -> object:
+def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
+    """Classify nodes into 'own', 'cited', and 'citing' sets.
+
+    - **own**: tier-0 — the author's own papers.
+    - **cited**: reachable from own via ``"cites"`` edges (the author's references).
+    - **citing**: reachable from own via ``"is_cited_by"`` edges (papers that cite the
+      author).
+    """
+    own: set[str] = {n for n, d in graph.nodes(data=True) if d.get("tier", 1) == 0}
+
+    cited: set[str] = set()
+    frontier = list(own)
+    while frontier:
+        node = frontier.pop()
+        for _, nbr, data in graph.out_edges(node, data=True):
+            if data.get("relationship") == "cites" and nbr not in cited | own:
+                cited.add(nbr)
+                frontier.append(nbr)
+
+    citing: set[str] = set()
+    frontier = list(own)
+    while frontier:
+        node = frontier.pop()
+        for _, nbr, data in graph.out_edges(node, data=True):
+            if data.get("relationship") == "is_cited_by" and nbr not in citing | own:
+                citing.add(nbr)
+                frontier.append(nbr)
+
+    return {"own": own, "cited": cited, "citing": citing}
+
+
+def _get_figure(visible_nodes: set[str] | None = None) -> object:
     mtime = GRAPH_PATH.stat().st_mtime if GRAPH_PATH.exists() else 0.0
-    positions = _get_positions(mtime)
+    all_positions = _get_positions(mtime)
+    positions = (
+        {n: p for n, p in all_positions.items() if n in visible_nodes}
+        if visible_nodes is not None
+        else all_positions
+    )
     cg, _ = _load_graph_builder()
     from src.viz_engine import build_plotly_3d
 
@@ -112,15 +149,43 @@ def _paper_card(doi: str) -> None:
 def _tab_citation_map() -> None:
     st.subheader("3D Citation Network")
     cg, _ = _load_graph_builder()
-    n_nodes = cg.graph.number_of_nodes()  # type: ignore[union-attr]
-    n_edges = cg.graph.number_of_edges()  # type: ignore[union-attr]
-    st.caption(f"{n_nodes} papers · {n_edges} citation edges")
+    graph: nx.DiGraph = cg.graph  # type: ignore[assignment]
+    n_nodes = graph.number_of_nodes()
+    n_edges = graph.number_of_edges()
 
     if n_nodes == 0:
         st.warning("Graph is empty — run `run_expansion.py` first.")
         return
 
-    fig = _get_figure()
+    # ---- Category toggles ------------------------------------------------
+    classification = _classify_nodes(graph)
+    n_own = len(classification["own"])
+    n_cited = len(classification["cited"])
+    n_citing = len(classification["citing"])
+
+    c1, c2, c3, _ = st.columns([2, 2, 2, 4])
+    show_own = c1.checkbox(f"Own ({n_own})", value=True, key="show_own")
+    show_cited = c2.checkbox(f"Cited ({n_cited})", value=True, key="show_cited")
+    show_citing = c3.checkbox(f"Citing ({n_citing})", value=True, key="show_citing")
+
+    visible: set[str] = set()
+    if show_own:
+        visible |= classification["own"]
+    if show_cited:
+        visible |= classification["cited"]
+    if show_citing:
+        visible |= classification["citing"]
+    # Always include any uncategorised nodes (tier > 2, edge cases)
+    all_nodes: set[str] = set(graph.nodes())
+    visible |= all_nodes - (
+        classification["own"] | classification["cited"] | classification["citing"]
+    )
+
+    st.caption(f"{len(visible)}/{n_nodes} papers · {n_edges} citation edges")
+
+    # ---- Figure -----------------------------------------------------------
+    filter_arg = visible if visible != all_nodes else None
+    fig = _get_figure(filter_arg)
     event = st.plotly_chart(
         fig,
         use_container_width=True,
