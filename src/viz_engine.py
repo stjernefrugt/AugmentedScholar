@@ -21,12 +21,73 @@ from typing import Any
 import networkx as nx
 import plotly.graph_objects as go
 
-# Colour gradient: blue (oldest) → red (most recent)
+# Colour gradient endpoints (kept for temporal_colormap utility function)
 _COLOUR_OLD = (0, 0, 220)
 _COLOUR_NEW = (220, 0, 0)
 
 _NODE_MIN_SIZE = 6.0
 _NODE_MAX_SIZE = 28.0
+
+# Plotly colorscale used in build_plotly_3d (blue → red)
+_COLORSCALE = [[0.0, "#0000dc"], [1.0, "#dc0000"]]
+# Fixed lower year bound: papers from ≤ 2010 all appear as deep blue
+_YEAR_MIN = 2010
+
+# Colorbar rendered on the left of the figure
+_COLORBAR: dict[str, Any] = {
+    "x": 0.0,
+    "xanchor": "left",
+    "y": 0.5,
+    "yanchor": "middle",
+    "title": {
+        "text": "Year",
+        "side": "right",
+        "font": {"color": "white", "size": 11},
+    },
+    "thickness": 12,
+    "len": 0.55,
+    "tickformat": "d",
+    "tickfont": {"color": "white", "size": 10},
+    "outlinewidth": 0,
+}
+
+# Per-category marker styles — rendered back-to-front so own papers appear on top
+_CATEGORY_STYLE: dict[str, dict[str, Any]] = {
+    "other": {
+        "symbol": "circle",
+        "size_scale": 0.9,
+        "opacity": 0.60,
+        "line_width": 0.3,
+        "line_color": "rgba(255,255,255,0.2)",
+        "name": "Other",
+    },
+    "citing": {
+        "symbol": "cross",
+        "size_scale": 1.0,
+        "opacity": 0.72,
+        "line_width": 0.4,
+        "line_color": "rgba(255,255,255,0.3)",
+        "name": "Citing (citing author)",
+    },
+    "cited": {
+        "symbol": "circle",
+        "size_scale": 1.0,
+        "opacity": 0.72,
+        "line_width": 0.4,
+        "line_color": "rgba(255,255,255,0.3)",
+        "name": "Cited (references)",
+    },
+    "own": {
+        "symbol": "diamond",
+        "size_scale": 1.8,
+        "opacity": 1.0,
+        "line_width": 1.5,
+        "line_color": "white",
+        "name": "Own papers",
+    },
+}
+# Render order: other → citing → cited → own (own drawn last = on top)
+_CAT_ORDER = ["other", "citing", "cited", "own"]
 
 
 def temporal_colormap(years: list[int]) -> list[str]:
@@ -98,55 +159,38 @@ def build_plotly_3d(
     graph: nx.DiGraph,
     *,
     positions: dict[str, tuple[float, float, float]] | None = None,
+    node_categories: dict[str, str] | None = None,
 ) -> go.Figure:
     """Assemble an interactive Plotly 3D scatter figure for *graph*.
 
-    Nodes are coloured by publication year (blue=old, red=recent) and sized
-    proportionally to their citation count (log scale).  Each node marker
-    carries its DOI as ``customdata`` so that Streamlit's ``on_select``
-    callback can identify which paper was clicked.
+    Nodes are coloured by publication year on a blue → red scale anchored at
+    :data:`_YEAR_MIN` (2010) with a colorbar on the left.  Size scales with
+    citation count (log scale).  Each marker carries its DOI as
+    ``customdata`` for Streamlit click-event callbacks.
+
+    When *node_categories* is provided, nodes are split into labelled traces
+    with distinct marker symbols: ``"own"`` (diamond, large, fully opaque),
+    ``"cited"`` (circle), ``"citing"`` (cross), ``"other"`` (circle, dim).
 
     Args:
         graph: Directed citation graph with node attributes *year*, *title*,
             *journal*, *citation_count*, *authors*.
         positions: Precomputed 3D positions from :func:`compute_layout_3d`.
             Computed on the fly when ``None``.
+        node_categories: Mapping of ``node_id → category`` where category is
+            one of ``"own"``, ``"cited"``, ``"citing"``, ``"other"``.
+            When ``None``, all nodes are rendered as a single trace.
 
     Returns:
-        :class:`plotly.graph_objects.Figure` containing an edge trace and a
-        node trace.
+        :class:`plotly.graph_objects.Figure` with edge trace and one or more
+        node traces.
     """
     if positions is None:
         positions = compute_layout_3d(graph)
 
     nodes = [n for n in graph.nodes() if n in positions]
-    years = [graph.nodes[n].get("year", 2000) for n in nodes]
-    colours = temporal_colormap(years)
-
-    xs: list[float] = []
-    ys: list[float] = []
-    zs: list[float] = []
-    sizes: list[float] = []
-    labels: list[str] = []
-    hovers: list[str] = []
-    custom: list[str] = []
-
-    for node in nodes:
-        x, y, z = positions[node]
-        attrs = graph.nodes[node]
-        xs.append(x)
-        ys.append(y)
-        zs.append(z)
-        sizes.append(_node_size(attrs.get("citation_count", 0)))
-        author_list: list[str] = attrs.get("authors", [])
-        first = author_list[0].split()[-1] if author_list else "?"
-        labels.append(f"{first} ({attrs.get('year', '?')})")
-        hovers.append(
-            f"<b>{attrs.get('title', node)}</b><br>"
-            f"{attrs.get('journal', '')}<br>"
-            f"Citations: {attrs.get('citation_count', 0)}"
-        )
-        custom.append(node)
+    all_years = [graph.nodes[n].get("year", _YEAR_MIN) for n in nodes]
+    cmax = max(all_years) if all_years else _YEAR_MIN + 14
 
     # Edge trace — grey semi-transparent lines
     ex: list[float | None] = []
@@ -160,49 +204,105 @@ def build_plotly_3d(
             ey += [sy, dy, None]
             ez += [sz, dz, None]
 
-    edge_trace = go.Scatter3d(
-        x=ex,
-        y=ey,
-        z=ez,
-        mode="lines",
-        line={"width": 0.5, "color": "rgba(150,150,150,0.25)"},
-        hoverinfo="none",
-        showlegend=False,
-    )
+    traces: list[go.Scatter3d] = [
+        go.Scatter3d(
+            x=ex,
+            y=ey,
+            z=ez,
+            mode="lines",
+            line={"width": 0.5, "color": "rgba(150,150,150,0.25)"},
+            hoverinfo="none",
+            showlegend=False,
+        )
+    ]
 
-    node_trace = go.Scatter3d(
-        x=xs,
-        y=ys,
-        z=zs,
-        mode="markers+text",
-        marker={
+    # Node traces rendered back-to-front; own papers appear on top
+    colorbar_placed = False
+    for cat in _CAT_ORDER:
+        if node_categories is not None:
+            cat_nodes = [n for n in nodes if node_categories.get(n, "other") == cat]
+        elif cat == "other":
+            cat_nodes = nodes  # single trace when no category mapping
+        else:
+            continue
+        if not cat_nodes:
+            continue
+
+        style = _CATEGORY_STYLE[cat]
+        years = [graph.nodes[n].get("year", _YEAR_MIN) for n in cat_nodes]
+        sizes = [
+            _node_size(graph.nodes[n].get("citation_count", 0)) * style["size_scale"]
+            for n in cat_nodes
+        ]
+        labels: list[str] = []
+        hovers: list[str] = []
+        for n in cat_nodes:
+            attrs = graph.nodes[n]
+            author_list: list[str] = attrs.get("authors", [])
+            first = author_list[0].split()[-1] if author_list else "?"
+            labels.append(f"{first} ({attrs.get('year', '?')})")
+            hovers.append(
+                f"<b>{attrs.get('title', n)}</b><br>"
+                f"{attrs.get('journal', '')}<br>"
+                f"Citations: {attrs.get('citation_count', 0)}"
+            )
+
+        marker: dict[str, Any] = {
+            "symbol": style["symbol"],
             "size": sizes,
-            "color": colours,
-            "opacity": 0.85,
-            "line": {"width": 0.5, "color": "white"},
-        },
-        text=labels,
-        textposition="top center",
-        textfont={"size": 8, "color": "white"},
-        hovertext=hovers,
-        hoverinfo="text",
-        customdata=custom,
-        name="papers",
-    )
+            "color": years,
+            "colorscale": _COLORSCALE,
+            "cmin": _YEAR_MIN,
+            "cmax": cmax,
+            "opacity": style["opacity"],
+            "line": {"width": style["line_width"], "color": style["line_color"]},
+            "showscale": not colorbar_placed,
+        }
+        if not colorbar_placed:
+            marker["colorbar"] = _COLORBAR
+            colorbar_placed = True
 
+        traces.append(
+            go.Scatter3d(
+                x=[positions[n][0] for n in cat_nodes],
+                y=[positions[n][1] for n in cat_nodes],
+                z=[positions[n][2] for n in cat_nodes],
+                mode="markers+text",
+                marker=marker,
+                text=labels,
+                textposition="top center",
+                textfont={"size": 8, "color": "white"},
+                hovertext=hovers,
+                hoverinfo="text",
+                customdata=cat_nodes,
+                name=style["name"],
+                showlegend=node_categories is not None,
+            )
+        )
+
+    show_legend = node_categories is not None
     fig = go.Figure(
-        data=[edge_trace, node_trace],
+        data=traces,
         layout=go.Layout(
             paper_bgcolor="#0a0a0a",
             font={"color": "white"},
             scene={
+                "domain": {"x": [0.08, 1.0], "y": [0, 1]},
                 "xaxis": {"visible": False},
                 "yaxis": {"visible": False},
                 "zaxis": {"visible": False},
                 "bgcolor": "#0a0a0a",
             },
             margin={"l": 0, "r": 0, "b": 0, "t": 0},
-            showlegend=False,
+            showlegend=show_legend,
+            legend={
+                "x": 0.09,
+                "y": 0.99,
+                "xanchor": "left",
+                "yanchor": "top",
+                "bgcolor": "rgba(10,10,10,0.7)",
+                "font": {"size": 11},
+            },
             uirevision="constant",
         ),
     )

@@ -92,7 +92,10 @@ def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
     return {"own": own, "cited": cited, "citing": citing}
 
 
-def _get_figure(visible_nodes: set[str] | None = None) -> object:
+def _get_figure(
+    visible_nodes: set[str] | None = None,
+    node_categories: dict[str, str] | None = None,
+) -> object:
     mtime = GRAPH_PATH.stat().st_mtime if GRAPH_PATH.exists() else 0.0
     all_positions = _get_positions(mtime)
     positions = (
@@ -103,7 +106,9 @@ def _get_figure(visible_nodes: set[str] | None = None) -> object:
     cg, _ = _load_graph_builder()
     from src.viz_engine import build_plotly_3d
 
-    return build_plotly_3d(cg.graph, positions=positions)  # type: ignore[arg-type]
+    return build_plotly_3d(  # type: ignore[arg-type]
+        cg.graph, positions=positions, node_categories=node_categories
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +189,13 @@ def _tab_citation_map() -> None:
     st.caption(f"{len(visible)}/{n_nodes} papers · {n_edges} citation edges")
 
     # ---- Figure -----------------------------------------------------------
+    node_cat: dict[str, str] = {}
+    for cat_name, node_set in classification.items():
+        for node in node_set:
+            node_cat[node] = cat_name  # "own", "cited", or "citing"
+
     filter_arg = visible if visible != all_nodes else None
-    fig = _get_figure(filter_arg)
+    fig = _get_figure(filter_arg, node_categories=node_cat)
     event = st.plotly_chart(
         fig,
         use_container_width=True,

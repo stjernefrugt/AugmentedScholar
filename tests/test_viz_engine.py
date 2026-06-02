@@ -127,14 +127,16 @@ class TestBuildPlotly3d:
         fig = build_plotly_3d(self._make_graph())
         assert isinstance(fig, go.Figure)
 
-    def test_two_traces_edges_and_nodes(self) -> None:
+    def test_edge_trace_plus_one_node_trace_without_categories(self) -> None:
+        # Without node_categories → single "other" node trace + edge trace
         fig = build_plotly_3d(self._make_graph())
         assert len(fig.data) == 2
 
     def test_node_trace_customdata_contains_dois(self) -> None:
         g = self._make_graph()
         fig = build_plotly_3d(g)
-        node_trace = fig.data[1]  # second trace is nodes
+        # Single node trace is at index 1 when no categories provided
+        node_trace = fig.data[1]
         assert set(node_trace.customdata) == {"10.1/a", "10.1/b"}
 
     def test_accepts_precomputed_positions(self) -> None:
@@ -148,6 +150,36 @@ class TestBuildPlotly3d:
 
         fig = build_plotly_3d(nx.DiGraph())
         assert isinstance(fig, go.Figure)
+
+    def test_category_traces_split_by_type(self) -> None:
+        g = self._make_graph()
+        cats = {"10.1/a": "own", "10.1/b": "cited"}
+        fig = build_plotly_3d(g, node_categories=cats)
+        # Edge trace + at least 2 node traces (own, cited)
+        assert len(fig.data) >= 3
+        # All DOIs present across node traces
+        all_custom: list[str] = []
+        for trace in fig.data[1:]:
+            all_custom.extend(list(trace.customdata or []))
+        assert set(all_custom) == {"10.1/a", "10.1/b"}
+
+    def test_own_trace_uses_diamond_symbol(self) -> None:
+        g = self._make_graph()
+        cats = {"10.1/a": "own", "10.1/b": "cited"}
+        fig = build_plotly_3d(g, node_categories=cats)
+        own_trace = next(t for t in fig.data if getattr(t, "name", "") == "Own papers")
+        assert own_trace.marker.symbol == "diamond"
+
+    def test_colorbar_on_first_node_trace(self) -> None:
+        fig = build_plotly_3d(self._make_graph())
+        # First node trace (index 1) should have showscale=True
+        assert fig.data[1].marker.showscale is True
+
+    def test_numeric_color_values_used_not_hex(self) -> None:
+        fig = build_plotly_3d(self._make_graph())
+        colors = fig.data[1].marker.color
+        # Colors must be numeric years, not hex strings
+        assert all(isinstance(c, int) for c in colors)
 
 
 # ---------------------------------------------------------------------------
