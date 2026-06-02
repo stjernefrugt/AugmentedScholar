@@ -198,7 +198,7 @@ def _tab_citation_map() -> None:
     fig = _get_figure(filter_arg, node_categories=node_cat)
     event = st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         on_select="rerun",
         key="citation_map",
     )
