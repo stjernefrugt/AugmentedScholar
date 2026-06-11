@@ -170,6 +170,21 @@ class TestBuildPlotly3d:
         own_trace = next(t for t in fig.data if getattr(t, "name", "") == "Own papers")
         assert own_trace.marker.symbol == "diamond"
 
+    def test_cross_trace_uses_circle_open_symbol(self) -> None:
+        g = self._make_graph()
+        cats = {"10.1/a": "own", "10.1/b": "cross"}
+        fig = build_plotly_3d(g, node_categories=cats)
+        cross_trace = next(t for t in fig.data if getattr(t, "name", "") == "Cross-cited")
+        assert cross_trace.marker.symbol == "circle-open"
+
+    def test_cross_rendered_below_own(self) -> None:
+        # "cross" must appear before "own" in the data list (back-to-front)
+        g = self._make_graph()
+        cats = {"10.1/a": "own", "10.1/b": "cross"}
+        fig = build_plotly_3d(g, node_categories=cats)
+        names = [getattr(t, "name", "") for t in fig.data]
+        assert names.index("Cross-cited") < names.index("Own papers")
+
     def test_colorbar_on_first_node_trace(self) -> None:
         fig = build_plotly_3d(self._make_graph())
         # First node trace (index 1) should have showscale=True

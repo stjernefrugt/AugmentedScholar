@@ -62,12 +62,14 @@ def _get_positions(mtime: float) -> dict[str, tuple[float, float, float]]:
 
 
 def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
-    """Classify nodes into 'own', 'cited', and 'citing' sets.
+    """Classify nodes into 'own', 'cited', 'citing', and 'cross' sets.
 
     - **own**: tier-0 — the author's own papers.
     - **cited**: reachable from own via ``"cites"`` edges (the author's references).
     - **citing**: reachable from own via ``"is_cited_by"`` edges (papers that cite the
       author).
+    - **cross**: papers cited directly by ≥ 2 own papers — structural connectors
+      between the author's own works.  Always a subset of *cited*.
     """
     own: set[str] = {n for n, d in graph.nodes(data=True) if d.get("tier", 1) == 0}
 
@@ -89,7 +91,15 @@ def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
                 citing.add(nbr)
                 frontier.append(nbr)
 
-    return {"own": own, "cited": cited, "citing": citing}
+    # Count how many distinct own papers each directly-cited paper comes from
+    cite_count: dict[str, int] = {}
+    for own_node in own:
+        for _, nbr, data in graph.out_edges(own_node, data=True):
+            if data.get("relationship") == "cites":
+                cite_count[nbr] = cite_count.get(nbr, 0) + 1
+    cross: set[str] = {doi for doi, cnt in cite_count.items() if cnt >= 2}
+
+    return {"own": own, "cited": cited, "citing": citing, "cross": cross}
 
 
 def _get_figure(
@@ -165,17 +175,22 @@ def _tab_citation_map() -> None:
     # ---- Category toggles ------------------------------------------------
     classification = _classify_nodes(graph)
     n_own = len(classification["own"])
+    n_cross = len(classification["cross"])
     n_cited = len(classification["cited"])
     n_citing = len(classification["citing"])
 
     c1, c2, c3, _ = st.columns([2, 2, 2, 4])
-    show_own = c1.checkbox(f"Own ({n_own})", value=True, key="show_own")
+    show_own = c1.checkbox(
+        f"Own ({n_own}) + cross ({n_cross})", value=True, key="show_own"
+    )
     show_cited = c2.checkbox(f"Cited ({n_cited})", value=True, key="show_cited")
     show_citing = c3.checkbox(f"Citing ({n_citing})", value=True, key="show_citing")
 
     visible: set[str] = set()
     if show_own:
+        # Always include cross-cited connectors alongside own papers
         visible |= classification["own"]
+        visible |= classification["cross"]
     if show_cited:
         visible |= classification["cited"]
     if show_citing:
@@ -183,16 +198,20 @@ def _tab_citation_map() -> None:
     # Always include any uncategorised nodes (tier > 2, edge cases)
     all_nodes: set[str] = set(graph.nodes())
     visible |= all_nodes - (
-        classification["own"] | classification["cited"] | classification["citing"]
+        classification["own"]
+        | classification["cited"]
+        | classification["citing"]
+        | classification["cross"]
     )
 
     st.caption(f"{len(visible)}/{n_nodes} papers · {n_edges} citation edges")
 
     # ---- Figure -----------------------------------------------------------
+    # Build per-node category with priority: own > cross > cited > citing > other
     node_cat: dict[str, str] = {}
-    for cat_name, node_set in classification.items():
-        for node in node_set:
-            node_cat[node] = cat_name  # "own", "cited", or "citing"
+    for cat_name in ("citing", "cited", "cross", "own"):
+        for node in classification[cat_name]:
+            node_cat[node] = cat_name
 
     filter_arg = visible if visible != all_nodes else None
     fig = _get_figure(filter_arg, node_categories=node_cat)

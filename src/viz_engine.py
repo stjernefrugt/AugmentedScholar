@@ -77,6 +77,15 @@ _CATEGORY_STYLE: dict[str, dict[str, Any]] = {
         "line_color": "rgba(255,255,255,0.3)",
         "name": "Cited (references)",
     },
+    "cross": {
+        # Papers cited by ≥ 2 own papers — structural connectors between own work
+        "symbol": "circle-open",
+        "size_scale": 0.75,
+        "opacity": 0.90,
+        "line_width": 1.2,
+        "line_color": "rgba(255,255,255,0.8)",
+        "name": "Cross-cited",
+    },
     "own": {
         "symbol": "diamond",
         "size_scale": 1.8,
@@ -86,8 +95,8 @@ _CATEGORY_STYLE: dict[str, dict[str, Any]] = {
         "name": "Own papers",
     },
 }
-# Render order: other → citing → cited → own (own drawn last = on top)
-_CAT_ORDER = ["other", "citing", "cited", "own"]
+# Render order: other → citing → cited → cross → own (own drawn last = on top)
+_CAT_ORDER = ["other", "citing", "cited", "cross", "own"]
 
 
 def temporal_colormap(years: list[int]) -> list[str]:
