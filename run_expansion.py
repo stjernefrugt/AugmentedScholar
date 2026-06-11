@@ -125,6 +125,38 @@ def _write_missing_pdfs_manifest(library_dir: Path, manifest_path: Path) -> int:
     return len(entries)
 
 
+def _preview_authors(ids: list[str], api_key: str | None, sample: int = 5) -> None:
+    """Print a sample of papers for each author ID and exit.
+
+    Args:
+        ids: List of Semantic Scholar author IDs to preview.
+        api_key: Optional SS API key.
+        sample: Number of papers to show per author.
+    """
+    from src.ss_client import SemanticScholarClient
+
+    divider = "-" * 60
+    with SemanticScholarClient(api_key=api_key) as ss:
+        for aid in ids:
+            total, papers = ss.preview_author_papers(aid, limit=sample)
+            print(f"\n{divider}")
+            print(f"  ID: {aid:<14}  Total papers on SS: {total}")
+            print(divider)
+            for p in papers:
+                title = (p.get("title") or "?")[:55]
+                year = p.get("year") or "?"
+                raw_authors: list[dict[str, str]] = p.get("authors") or []
+                names = ", ".join(a.get("name", "?") for a in raw_authors[:3])
+                if len(raw_authors) > 3:
+                    names += " et al."
+                print(f"  {year}  {title}")
+                print(f"         {names}")
+            if not papers:
+                print("  (no papers returned)")
+    print(f"\n{divider}\n")
+    sys.exit(0)
+
+
 def _load_known_dois(path: Path) -> set[str]:
     """Load a newline-delimited file of DOIs to skip during ingestion.
 
@@ -161,7 +193,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--author-id",
-        help="Semantic Scholar author ID (integer string)",
+        nargs="+",
+        metavar="ID",
+        help=(
+            "One or more Semantic Scholar author IDs. "
+            "Use multiple values to merge fragmented profiles, e.g.: "
+            "--author-id 82852897 2237365403 6309998"
+        ),
     )
     parser.add_argument(
         "--gscholar-url",
@@ -187,6 +225,16 @@ def main() -> None:
         "--find-author",
         metavar="NAME",
         help="Search for your Semantic Scholar author ID by name and exit",
+    )
+    parser.add_argument(
+        "--preview-authors",
+        nargs="+",
+        metavar="ID",
+        help=(
+            "Preview the first few papers for each author ID and exit. "
+            "Use this to verify which IDs belong to you before running "
+            "a full expansion, e.g.: --preview-authors 82852897 2237365403"
+        ),
     )
     parser.add_argument(
         "--library-dir",
@@ -266,7 +314,11 @@ def main() -> None:
         _find_author(args.find_author, args.api_key)
         return
 
-    if not args.author_id and not args.gscholar_url:
+    if args.preview_authors:
+        _preview_authors(args.preview_authors, args.api_key)
+        return  # _preview_authors calls sys.exit, but keeps mypy happy
+
+    if not args.author_id and not args.gscholar_url:  # type: ignore[truthy-bool]
         parser.error(
             "Provide --author-id (Semantic Scholar) or "
             "--gscholar-url (Google Scholar profile URL)."
@@ -306,23 +358,38 @@ def main() -> None:
             args.gscholar_url, gscholar_client=gs_client
         )
         author_label = args.gscholar_url
+        results = [result]
     else:
-        result = explorer.expand_from_author(args.author_id)
-        author_label = args.author_id
+        author_ids: list[str] = args.author_id
+        results = []
+        for aid in author_ids:
+            logger.info("--- Expanding author ID %s ---", aid)
+            results.append(explorer.expand_from_author(aid))
+        author_label = ", ".join(author_ids)
 
     graph.save()
+
+    total_records = sum(len(r.records) for r in results)
+    total_new = sum(r.new_ingestions for r in results)
+    total_skipped = sum(r.skipped for r in results)
+    total_errors: list[str] = [e for r in results for e in r.errors]
 
     divider = "=" * 52
     print(f"\n{divider}")
     print(f"  Expansion complete — {author_label}")
+    if len(results) > 1:
+        print(f"  Author IDs     : {len(results)}")
     print(divider)
-    print(f"  Total records  : {len(result.records)}")
-    print(f"  New ingestions : {result.new_ingestions}")
-    print(f"  Skipped (dup)  : {result.skipped}")
-    print(f"  Errors         : {len(result.errors)}")
+    print(f"  Total records  : {total_records}")
+    print(f"  New ingestions : {total_new}")
+    print(f"  Skipped (dup)  : {total_skipped}")
+    print(f"  Errors         : {len(total_errors)}")
     print(f"  Graph nodes    : {graph.graph.number_of_nodes()}")
     print(f"  Graph edges    : {graph.graph.number_of_edges()}")
     print(f"{divider}\n")
+
+    # For output JSON use the last result (single-ID runs) or skip for multi
+    result = results[-1]
 
     # Enrichment pass (auto-enabled for GS depth-0 runs)
     run_enrich = args.enrich or (args.gscholar_url and args.depth == 0)
@@ -352,9 +419,9 @@ def main() -> None:
         except OSError as exc:
             logger.error("Failed to write output JSON: %s", exc)
 
-    if result.errors:
-        logger.warning("%d error(s) during expansion:", len(result.errors))
-        for err in result.errors:
+    if total_errors:
+        logger.warning("%d error(s) during expansion:", len(total_errors))
+        for err in total_errors:
             logger.warning("  - %s", err)
 
 

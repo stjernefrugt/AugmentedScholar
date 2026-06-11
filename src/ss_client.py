@@ -110,6 +110,34 @@ class SemanticScholarClient:
             logger.warning("SS paper search failed for '%s': %s", title, exc)
             return None
 
+    def preview_author_papers(
+        self, author_id: str, limit: int = 5
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Fetch a small sample of papers for *author_id* without full pagination.
+
+        Useful for quickly identifying whether an author ID belongs to the
+        right person before committing to a full expansion.
+
+        Args:
+            author_id: Semantic Scholar integer author ID string.
+            limit: Maximum number of papers to return (default 5).
+
+        Returns:
+            Tuple of ``(total_papers, papers)`` where *total_papers* is the
+            count reported by the API and *papers* is the sample list.
+        """
+        try:
+            resp = self._request(
+                f"{_BASE}/author/{author_id}/papers",
+                params={"fields": "title,authors,year", "limit": limit, "offset": 0},
+            )
+            body: dict[str, Any] = resp.json()
+            total: int = body.get("total", 0)
+            return total, list(body.get("data") or [])
+        except Exception as exc:
+            logger.error("Preview failed for author %s: %s", author_id, exc)
+            return 0, []
+
     def get_author_papers(self, author_id: str) -> list[dict[str, Any]]:
         """Fetch all papers attributed to a Semantic Scholar author.
 

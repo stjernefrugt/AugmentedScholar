@@ -1,7 +1,8 @@
 """Streamlit dashboard — AugmentedScholar Network Analysis Engine.
 
-Three tabs:
-  * Citation Map   — interactive 3D citation network; click a node for details.
+Four tabs:
+  * Citation Map   — interactive 3D citation network; click a node to open its DOI.
+  * Papers         — reverse-chronological paper list with formatted citations.
   * Gap Analysis   — isolated nodes, missing PDFs, missing abstracts.
   * Analytics      — centrality leaderboard table.
 
@@ -17,8 +18,11 @@ from __future__ import annotations
 # CLI args parsed before Streamlit intercepts sys.argv
 # ---------------------------------------------------------------------------
 import argparse as _argparse
+import html as _html
+import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import networkx as nx
 import streamlit as st
@@ -62,14 +66,12 @@ def _get_positions(mtime: float) -> dict[str, tuple[float, float, float]]:
 
 
 def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
-    """Classify nodes into 'own', 'cited', 'citing', and 'cross' sets.
+    """Classify nodes into 'own', 'cited', and 'citing' sets.
 
     - **own**: tier-0 — the author's own papers.
     - **cited**: reachable from own via ``"cites"`` edges (the author's references).
     - **citing**: reachable from own via ``"is_cited_by"`` edges (papers that cite the
       author).
-    - **cross**: papers cited directly by ≥ 2 own papers — structural connectors
-      between the author's own works.  Always a subset of *cited*.
     """
     own: set[str] = {n for n, d in graph.nodes(data=True) if d.get("tier", 1) == 0}
 
@@ -91,15 +93,7 @@ def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
                 citing.add(nbr)
                 frontier.append(nbr)
 
-    # Count how many distinct own papers each directly-cited paper comes from
-    cite_count: dict[str, int] = {}
-    for own_node in own:
-        for _, nbr, data in graph.out_edges(own_node, data=True):
-            if data.get("relationship") == "cites":
-                cite_count[nbr] = cite_count.get(nbr, 0) + 1
-    cross: set[str] = {doi for doi, cnt in cite_count.items() if cnt >= 2}
-
-    return {"own": own, "cited": cited, "citing": citing, "cross": cross}
+    return {"own": own, "cited": cited, "citing": citing}
 
 
 def _get_figure(
@@ -119,6 +113,135 @@ def _get_figure(
     return build_plotly_3d(  # type: ignore[arg-type]
         cg.graph, positions=positions, node_categories=node_categories
     )
+
+
+# ---------------------------------------------------------------------------
+# Citation formatting
+# ---------------------------------------------------------------------------
+
+_CITATION_STYLES = ["APA", "MLA", "Chicago", "Vancouver", "BibTeX"]
+
+
+def _author_last_first(name: str) -> str:
+    """'Alice Smith' → 'Smith, A.'  (handles 'Smith, Alice' too)."""
+    name = name.strip()
+    if "," in name:
+        last, *rest = name.split(",", 1)
+        first_parts = rest[0].strip().split() if rest else []
+    else:
+        parts = name.split()
+        if not parts:
+            return name
+        last = parts[-1]
+        first_parts = parts[:-1]
+    initials = " ".join(p[0] + "." for p in first_parts if p)
+    return f"{last.strip()}, {initials}" if initials else last.strip()
+
+
+def _author_display(name: str) -> str:
+    """Return name with normalised whitespace."""
+    return " ".join(name.strip().split())
+
+
+def _bib_key(doi: str, authors: list[str], year: int | str | None) -> str:
+    first = (
+        authors[0].strip().split(",")[0].split()[-1].lower() if authors else "unknown"
+    )
+    return re.sub(r"[^a-z0-9]", "", first) + str(year or "nd")
+
+
+def _format_citation(doi: str, attrs: dict[str, Any], style: str) -> str:
+    """Return a formatted citation string for *style*."""
+    title: str = attrs.get("title") or doi
+    authors: list[str] = attrs.get("authors") or []
+    year = attrs.get("year")
+    journal: str = attrs.get("journal") or ""
+    url = f"https://doi.org/{doi}" if doi else ""
+
+    if style == "APA":
+        if authors:
+            fmt = [_author_last_first(a) for a in authors]
+            if len(fmt) <= 7:
+                author_str = (
+                    fmt[0] if len(fmt) == 1 else ", ".join(fmt[:-1]) + ", & " + fmt[-1]
+                )
+            else:
+                author_str = ", ".join(fmt[:6]) + ", ... " + fmt[-1]
+        else:
+            author_str = ""
+        year_str = f"({year})." if year else "(n.d.)."
+        journal_part = f" *{journal}*." if journal else ""
+        doi_part = f" {url}" if url else ""
+        lead = " ".join(p for p in [author_str, year_str] if p)
+        return f"{lead} {title}.{journal_part}{doi_part}"
+
+    if style == "MLA":
+        if authors:
+            p = authors[0].strip().split()
+            first_fmt = (
+                f"{p[-1]}, {' '.join(p[:-1])}" if len(p) >= 2 else authors[0].strip()
+            )
+            author_str = first_fmt + ", et al." if len(authors) > 1 else first_fmt + "."
+        else:
+            author_str = ""
+        journal_part = f" *{journal}*," if journal else ""
+        year_part = f" {year}," if year else ""
+        doi_part = f" {url}." if url else "."
+        return f'{author_str} "{title}."{journal_part}{year_part}{doi_part}'
+
+    if style == "Chicago":
+        if authors:
+            p = authors[0].strip().split()
+            first_fmt = (
+                f"{p[-1]}, {' '.join(p[:-1])}" if len(p) >= 2 else authors[0].strip()
+            )
+            rest = [_author_display(a) for a in authors[1:]]
+            author_str = (
+                first_fmt + ", and " + ", ".join(rest) + "."
+                if rest
+                else first_fmt + "."
+            )
+        else:
+            author_str = ""
+        journal_part = f" *{journal}*" if journal else ""
+        year_part = f" ({year})" if year else ""
+        doi_part = f". {url}" if url else ""
+        return f'{author_str} "{title}."{journal_part}{year_part}{doi_part}.'
+
+    if style == "Vancouver":
+        if authors:
+            fmt = [_author_last_first(a) for a in authors[:6]]
+            author_str = ", ".join(fmt) + (", et al" if len(authors) > 6 else "")
+        else:
+            author_str = ""
+        journal_part = f" {journal}." if journal else ""
+        year_part = f" {year};" if year else ""
+        doi_part = f" doi:{doi}" if doi else ""
+        return f"{author_str}.{journal_part}{year_part}{doi_part}"
+
+    if style == "BibTeX":
+        key = _bib_key(doi, authors, year)
+        bib_authors = " and ".join(
+            (
+                f"{a.strip().split()[-1]}, {' '.join(a.strip().split()[:-1])}"
+                if len(a.strip().split()) > 1
+                else a.strip()
+            )
+            for a in authors
+        )
+        lines = [f"@article{{{key},", f"  title     = {{{title}}},"]
+        if bib_authors:
+            lines.append(f"  author    = {{{bib_authors}}},")
+        if journal:
+            lines.append(f"  journal   = {{{journal}}},")
+        if year:
+            lines.append(f"  year      = {{{year}}},")
+        if doi:
+            lines.append(f"  doi       = {{{doi}}},")
+        lines.append("}")
+        return "\n".join(lines)
+
+    return f"{title} ({year}). {url}"
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +284,53 @@ def _paper_card(doi: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _render_paper_list(
+    graph: nx.DiGraph,
+    list_nodes: set[str],
+    selected_doi: str,
+) -> None:
+    """Scrollable left-panel paper list; highlights the selected node."""
+    if not list_nodes:
+        st.caption("No papers — select a category above.")
+        return
+
+    rows = sorted(
+        [(doi, graph.nodes[doi]) for doi in list_nodes],
+        key=lambda x: x[1].get("year") or 0,
+        reverse=True,
+    )
+    st.caption(f"{len(rows)} paper(s)")
+
+    with st.container(height=620, border=False):
+        for doi, attrs in rows:
+            raw_title = attrs.get("title") or doi
+            title = _html.escape(raw_title[:68] + ("…" if len(raw_title) > 68 else ""))
+            year = attrs.get("year", "")
+            authors: list[str] = attrs.get("authors") or []
+            first = _html.escape(authors[0].split()[-1] if authors else "")
+            meta = f"{first}{' · ' if first else ''}{year}"
+
+            if doi == selected_doi:
+                st.markdown(
+                    f'<div style="background:rgba(91,155,213,0.18);'
+                    f"border-left:3px solid #5b9bd5;"
+                    f'padding:6px 8px;border-radius:3px;margin:1px 0">'
+                    f'<span style="font-size:12px;font-weight:600">{title}</span><br>'
+                    f'<span style="font-size:11px;color:#aaa">{meta}</span>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div style="border-left:3px solid transparent;'
+                    f'padding:5px 8px;margin:1px 0">'
+                    f'<span style="font-size:12px">{title}</span><br>'
+                    f'<span style="font-size:11px;color:#aaa">{meta}</span>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+
 def _tab_citation_map() -> None:
     st.subheader("3D Citation Network")
     cg, _ = _load_graph_builder()
@@ -172,61 +342,129 @@ def _tab_citation_map() -> None:
         st.warning("Graph is empty — run `run_expansion.py` first.")
         return
 
-    # ---- Category toggles ------------------------------------------------
+    # ---- Category toggles (full-width row) --------------------------------
     classification = _classify_nodes(graph)
     n_own = len(classification["own"])
-    n_cross = len(classification["cross"])
     n_cited = len(classification["cited"])
     n_citing = len(classification["citing"])
 
     c1, c2, c3, _ = st.columns([2, 2, 2, 4])
-    show_own = c1.checkbox(
-        f"Own ({n_own}) + cross ({n_cross})", value=True, key="show_own"
-    )
+    show_own = c1.checkbox(f"Own ({n_own})", value=True, key="show_own")
     show_cited = c2.checkbox(f"Cited ({n_cited})", value=True, key="show_cited")
     show_citing = c3.checkbox(f"Citing ({n_citing})", value=True, key="show_citing")
 
+    # Papers shown in left panel (strictly from selected categories)
+    list_nodes: set[str] = set()
+    if show_own:
+        list_nodes |= classification["own"]
+    if show_cited:
+        list_nodes |= classification["cited"]
+    if show_citing:
+        list_nodes |= classification["citing"]
+
+    # 3D plot also renders uncategorised nodes that don't belong to any set
+    all_nodes: set[str] = set(graph.nodes())
+    uncategorised = all_nodes - (
+        classification["own"] | classification["cited"] | classification["citing"]
+    )
+    visible = list_nodes | uncategorised
+
+    # Current highlighted DOI (set by previous click interaction)
+    selected_doi: str = st.session_state.get("_selected_doi", "")
+
+    # ---- Two-column layout: paper list | 3D plot --------------------------
+    left, right = st.columns([1, 3], gap="small")
+
+    with left:
+        _render_paper_list(graph, list_nodes, selected_doi)
+
+    with right:
+        st.caption(f"{len(visible)}/{n_nodes} papers · {n_edges} citation edges")
+
+        node_cat: dict[str, str] = {}
+        for cat_name in ("citing", "cited", "own"):
+            for node in classification[cat_name]:
+                node_cat[node] = cat_name
+
+        filter_arg = visible if visible != all_nodes else None
+        fig = _get_figure(filter_arg, node_categories=node_cat)
+        event = st.plotly_chart(
+            fig,
+            width="stretch",
+            on_select="rerun",
+            key="citation_map",
+        )
+
+        points = getattr(getattr(event, "selection", None), "points", [])
+        if points:
+            doi = str(points[0].get("customdata", ""))
+            if doi:
+                # Sync left-panel highlight — rerun so the list sees the new value
+                if doi != selected_doi:
+                    st.session_state["_selected_doi"] = doi
+                    st.rerun()
+                # Open DOI in a new browser tab (once per selection)
+                if doi != st.session_state.get("_last_doi_opened"):
+                    st.session_state["_last_doi_opened"] = doi
+                    import streamlit.components.v1 as components
+
+                    components.html(
+                        f"<script>"
+                        f'window.open("https://doi.org/{doi}", "_blank");'
+                        f"</script>",
+                        height=0,
+                    )
+                _paper_card(doi)
+
+
+def _tab_papers() -> None:
+    st.subheader("Papers")
+    cg, _ = _load_graph_builder()
+    graph: nx.DiGraph = cg.graph  # type: ignore[assignment]
+
+    if graph.number_of_nodes() == 0:
+        st.info("No papers yet — run `run_expansion.py` first.")
+        return
+
+    classification = _classify_nodes(graph)
+
+    c1, c2, c3, _, c5 = st.columns([1, 1, 1, 1, 3])
+    show_own = c1.checkbox("Own", value=True, key="papers_own")
+    show_cited = c2.checkbox("Cited", value=False, key="papers_cited")
+    show_citing = c3.checkbox("Citing", value=False, key="papers_citing")
+    style: str = c5.selectbox(  # type: ignore[assignment]
+        "Citation style", _CITATION_STYLES, key="papers_style"
+    )
+
     visible: set[str] = set()
     if show_own:
-        # Always include cross-cited connectors alongside own papers
         visible |= classification["own"]
-        visible |= classification["cross"]
     if show_cited:
         visible |= classification["cited"]
     if show_citing:
         visible |= classification["citing"]
-    # Always include any uncategorised nodes (tier > 2, edge cases)
-    all_nodes: set[str] = set(graph.nodes())
-    visible |= all_nodes - (
-        classification["own"]
-        | classification["cited"]
-        | classification["citing"]
-        | classification["cross"]
+
+    rows = sorted(
+        [(doi, graph.nodes[doi]) for doi in visible],
+        key=lambda x: x[1].get("year") or 0,
+        reverse=True,
     )
 
-    st.caption(f"{len(visible)}/{n_nodes} papers · {n_edges} citation edges")
+    st.caption(f"{len(rows)} paper(s)")
 
-    # ---- Figure -----------------------------------------------------------
-    # Build per-node category with priority: own > cross > cited > citing > other
-    node_cat: dict[str, str] = {}
-    for cat_name in ("citing", "cited", "cross", "own"):
-        for node in classification[cat_name]:
-            node_cat[node] = cat_name
+    if not rows:
+        st.info("No papers selected — tick at least one category above.")
+        return
 
-    filter_arg = visible if visible != all_nodes else None
-    fig = _get_figure(filter_arg, node_categories=node_cat)
-    event = st.plotly_chart(
-        fig,
-        width="stretch",
-        on_select="rerun",
-        key="citation_map",
-    )
-
-    points = getattr(getattr(event, "selection", None), "points", [])
-    if points:
-        doi = points[0].get("customdata", "")
-        if doi:
-            _paper_card(str(doi))
+    if style == "BibTeX":
+        all_bib = "\n\n".join(
+            _format_citation(doi, attrs, "BibTeX") for doi, attrs in rows
+        )
+        st.code(all_bib, language="bibtex")
+    else:
+        for doi, attrs in rows:
+            st.markdown(_format_citation(doi, attrs, style))
+            st.divider()
 
 
 def _tab_gap_analysis() -> None:
@@ -300,12 +538,16 @@ def main() -> None:
     )
     st.title("AugmentedScholar — Network Analysis")
 
-    tab1, tab2, tab3 = st.tabs(["Citation Map", "Gap Analysis", "Analytics"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Citation Map", "Papers", "Gap Analysis", "Analytics"]
+    )
     with tab1:
         _tab_citation_map()
     with tab2:
-        _tab_gap_analysis()
+        _tab_papers()
     with tab3:
+        _tab_gap_analysis()
+    with tab4:
         _tab_analytics()
 
 

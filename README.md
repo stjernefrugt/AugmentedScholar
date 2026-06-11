@@ -7,11 +7,14 @@ A **Scientific Second Brain** that maps your citation ecosystem into an interact
 ## Features
 
 - **Bibliographic expansion** — seed from Semantic Scholar or Google Scholar, traverse references and citations up to 2 hops
+- **Fragmented-profile merging** — supply multiple Semantic Scholar author IDs to consolidate split profiles
+- **Author preview** — inspect a few sample papers per ID before committing to a full expansion
 - **PDF acquisition** — Unpaywall (free OA) → missing-PDF manifest → Playwright batch downloader with institute SSO support
 - **Metadata enrichment** — fetches abstracts, citation counts, and keywords for any paper missing them
 - **ISO 4 filenames** — journal names abbreviated via pyiso4 / LTWA standard (`nat-commun`, `phys-rev-lett`)
 - **Network analysis** — betweenness and eigenvector centrality, gap analysis (isolated nodes, high-centrality papers without PDFs, missing abstracts)
-- **3D visualization** — interactive Plotly Scatter3d dashboard with distinct marker shapes per paper type, blue→red year colorscale, and click-to-inspect paper cards
+- **3D visualization** — interactive Plotly Scatter3d dashboard; left-panel paper list highlights the selected node, clicking a node opens its DOI in a new tab
+- **Citation export** — Papers tab with APA / MLA / Chicago / Vancouver / BibTeX formatting, filtered by paper type
 
 ---
 
@@ -70,20 +73,42 @@ playwright install chromium
 python run_expansion.py --find-author "Your Name"
 ```
 
+Semantic Scholar sometimes splits one researcher across several IDs. Use `--preview-authors` to inspect each candidate before choosing which ones to use:
+
+```bash
+python run_expansion.py \
+    --preview-authors 82852897 2237365403 6309998 \
+    --api-key YOUR_SS_KEY
+```
+
+This prints the 5 most recent papers per ID and exits — no files are written.
+
 ### 2 — Build your library
 
-**From Semantic Scholar** (fast, ~1 req/s unauthenticated):
+**Single author ID:**
 ```bash
 python run_expansion.py --author-id 1741101 --library-dir ./library
 ```
 
-**From Google Scholar** (more complete Tier 0, recommended):
+**Multiple IDs** (merges fragmented profiles — duplicates are skipped automatically):
+```bash
+python run_expansion.py \
+    --author-id 82852897 2237365403 6309998 \
+    --api-key YOUR_SS_KEY \
+    --library-dir ./library \
+    --unpaywall-email your@email.com \
+    --enrich
+```
+
+**From Google Scholar** (more complete Tier 0, but subject to IP blocks):
 ```bash
 python run_expansion.py \
     --gscholar-url "https://scholar.google.com/citations?user=AbCdEfGhIjK" \
     --library-dir ./library \
     --unpaywall-email your@email.com
 ```
+
+If Google Scholar blocks the request, retry with `--scholar-proxy free` (rotates through public proxies) or connect via institute VPN.
 
 **Full two-hop expansion** (author → references → their references):
 ```bash
@@ -98,16 +123,19 @@ python run_expansion.py \
 
 | Flag | Default | Description |
 |---|---|---|
+| `--author-id` | — | One or more Semantic Scholar author IDs |
+| `--preview-authors` | — | Print sample papers per ID and exit (no files written) |
 | `--depth` | `1` | `0` = own papers only, `1` = + direct refs/cites, `2` = + one further hop |
 | `--api-key` | — | Semantic Scholar API key; raises rate limit from ~1 to ~10 req/s |
 | `--unpaywall-email` | — | Enables Unpaywall OA resolver before adding to missing-PDF manifest |
 | `--enrich` | off | Fetch missing abstracts/keywords after expansion (auto-on at `--depth 0`) |
 | `--enrich-delay` | `1.0` | Seconds between enrichment requests |
+| `--scholar-proxy` | — | Proxy for Google Scholar: `free` or `http://host:port` |
 
 ### 3 — Download missing PDFs
 
 ```bash
-# Generate manifest (done automatically by run_expansion.py):
+# Manifest is written automatically by run_expansion.py:
 # library/missing_pdfs.json
 
 # Open browser, log in to your institute once, then auto-download:
@@ -125,11 +153,25 @@ streamlit run app.py -- --library-dir ./library --graph-path ./library/citation_
 
 Open `http://localhost:8501`.
 
-**Citation Map tab** — 3D network with toggles for Own / Cited / Citing papers. Click any node for a paper card (title, authors, abstract, keywords, DOI link).
+#### Citation Map tab
 
-**Gap Analysis tab** — isolated nodes, high-centrality papers without PDFs, papers missing abstracts.
+3D network with toggles for Own / Cited / Citing papers.
 
-**Analytics tab** — centrality leaderboard sorted by betweenness.
+- **Left panel** — scrollable paper list filtered by the active toggles; the selected paper is highlighted with a blue accent. Empty when all toggles are off.
+- **Click a node** — opens the paper's DOI page in a new browser tab and shows a detail card (title, authors, abstract, keywords) below the plot.
+- **Marker shapes** — diamond = own, circle = cited, cross = citing; nodes coloured blue→red by year (colorbar on left).
+
+#### Papers tab
+
+Reverse-chronological paper list with Own / Cited / Citing filter checkboxes and a citation style selector (APA, MLA, Chicago, Vancouver, BibTeX). BibTeX output is a single copyable code block.
+
+#### Gap Analysis tab
+
+Isolated nodes, high-centrality papers without PDFs, papers missing abstracts.
+
+#### Analytics tab
+
+Centrality leaderboard (betweenness + eigenvector) for the top 100 nodes.
 
 ### 5 — Migrate existing library filenames (after first run)
 
@@ -148,7 +190,7 @@ python migrate_filenames.py --library-dir ./library --apply
 | Service | Used for | Auth | Rate limit |
 |---|---|---|---|
 | [Semantic Scholar Graph API v1](https://api.semanticscholar.org/graph/v1) | Paper search, author papers, references, citations | Optional API key | ~1 req/s (unauth) / ~10 req/s (key) |
-| [Google Scholar](https://scholar.google.com) | Tier 0 author paper list | None (scraped via `scholarly`) | Throttled automatically |
+| [Google Scholar](https://scholar.google.com) | Tier 0 author paper list | None (scraped via `scholarly`) | Throttled; IP blocks after repeated requests |
 | [Unpaywall](https://unpaywall.org/products/api) | Open-access PDF URL lookup | Email address (free) | 100k req/day |
 
 The Semantic Scholar client retries automatically on `429 / 500 / 502 / 503 / 504` with exponential backoff (1 s → 2 s → 4 s … capped at 60 s, up to 5 retries).
@@ -158,7 +200,7 @@ The Semantic Scholar client retries automatically on `429 / 500 / 502 / 503 / 50
 ```
 /author/search
 /paper/search
-/author/{id}/papers
+/author/{id}/papers        (also used with limit=5 for --preview-authors)
 /paper/{id}/references
 /paper/{id}/citations
 ```
