@@ -174,6 +174,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--scholar-proxy",
+        metavar="PROXY",
+        help=(
+            "Proxy for Google Scholar requests. "
+            "Use 'free' to rotate through free public proxies, "
+            "or supply an explicit URL (e.g. 'http://host:port'). "
+            "Needed when Google blocks direct scraping."
+        ),
+    )
+    parser.add_argument(
         "--find-author",
         metavar="NAME",
         help="Search for your Semantic Scholar author ID by name and exit",
@@ -291,7 +301,7 @@ def main() -> None:
     )
 
     if args.gscholar_url:
-        gs_client = GoogleScholarClient()
+        gs_client = GoogleScholarClient(proxy=getattr(args, "scholar_proxy", None))
         result = explorer.expand_from_google_scholar(
             args.gscholar_url, gscholar_client=gs_client
         )
