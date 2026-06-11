@@ -4,7 +4,30 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import httpx
+
 from src.ss_client import SemanticScholarClient
+
+
+def _ok(body: dict[str, object]) -> MagicMock:
+    """Return a mock 200 response with *body* as JSON."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = body
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+def _err(status: int) -> MagicMock:
+    """Return a mock error response that raises on raise_for_status."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+        f"HTTP {status}",
+        request=MagicMock(),
+        response=MagicMock(),
+    )
+    return resp
 
 
 def _make_client(
@@ -19,13 +42,7 @@ def _make_client(
         Tuple of (client, mock_http_client).
     """
     mock_http = MagicMock()
-    mock_responses = []
-    for body in responses:
-        resp = MagicMock()
-        resp.json.return_value = body
-        resp.raise_for_status.return_value = None
-        mock_responses.append(resp)
-    mock_http.get.side_effect = mock_responses
+    mock_http.get.side_effect = [_ok(b) for b in responses]
     client = SemanticScholarClient(client=mock_http)
     return client, mock_http
 
@@ -81,3 +98,59 @@ class TestPaginate:
         result = client.get_paper_citations("paper-id")
         assert len(result) == 1
         assert result[0]["paperId"] == "cite1"
+
+
+class TestBackoff:
+    """Exponential back-off on 429 / 5xx responses."""
+
+    def _no_sleep_client(self, side_effects: list[MagicMock]) -> SemanticScholarClient:
+        """Client with backoff_base=0 so tests run without actual sleeping."""
+        mock_http = MagicMock()
+        mock_http.get.side_effect = side_effects
+        return SemanticScholarClient(client=mock_http, backoff_base=0.0)
+
+    def test_429_retried_then_succeeds(self) -> None:
+        paper = {"paperId": "p1", "title": "T", "year": 2021}
+        client = self._no_sleep_client([_err(429), _ok({"data": [paper], "total": 1})])
+        result = client.get_author_papers("123")
+        assert result == [paper]
+
+    def test_503_retried_then_succeeds(self) -> None:
+        paper = {"paperId": "p2", "title": "T2", "year": 2022}
+        client = self._no_sleep_client([_err(503), _ok({"data": [paper], "total": 1})])
+        result = client.get_author_papers("123")
+        assert result == [paper]
+
+    def test_retry_count_matches_attempts(self) -> None:
+        # 2 failures then success — should call get() exactly 3 times
+        paper = {"paperId": "px", "title": "Tx", "year": 2020}
+        mock_http = MagicMock()
+        mock_http.get.side_effect = [
+            _err(429),
+            _err(429),
+            _ok({"data": [paper], "total": 1}),
+        ]
+        client = SemanticScholarClient(client=mock_http, backoff_base=0.0)
+        result = client.get_author_papers("123")
+        assert result == [paper]
+        assert mock_http.get.call_count == 3
+
+    def test_max_retries_exhausted_returns_empty(self) -> None:
+        # All attempts return 429 — should give up and return []
+        mock_http = MagicMock()
+        mock_http.get.return_value = _err(429)
+        client = SemanticScholarClient(
+            client=mock_http, max_retries=2, backoff_base=0.0
+        )
+        result = client.get_author_papers("123")
+        assert result == []
+        # 1 initial + 2 retries = 3 total calls
+        assert mock_http.get.call_count == 3
+
+    def test_non_retryable_404_not_retried(self) -> None:
+        mock_http = MagicMock()
+        mock_http.get.return_value = _err(404)
+        client = SemanticScholarClient(client=mock_http, backoff_base=0.0)
+        result = client.get_author_papers("123")
+        assert result == []
+        assert mock_http.get.call_count == 1  # no retry for 404

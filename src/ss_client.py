@@ -7,6 +7,7 @@ methods aggregate across pages so callers receive complete result sets.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from types import TracebackType
 from typing import Any
@@ -19,6 +20,8 @@ _PAPER_FIELDS = (
     "citationCount,externalIds,openAccessPdf"
 )
 _PAGE_SIZE = 100
+# HTTP status codes that warrant a retry with exponential back-off
+_RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +46,12 @@ class SemanticScholarClient:
         client: httpx.Client | None = None,
         api_key: str | None = None,
         request_delay: float = 0.5,
+        max_retries: int = 5,
+        backoff_base: float = 1.0,
     ) -> None:
         self._delay = request_delay
+        self._max_retries = max_retries
+        self._backoff_base = backoff_base
         headers: dict[str, str] = {}
         if api_key:
             headers["x-api-key"] = api_key
@@ -68,14 +75,13 @@ class SemanticScholarClient:
             ``paperCount``, and ``citationCount``.  Empty list on error.
         """
         try:
-            response = self._client.get(
+            response = self._request(
                 f"{_BASE}/author/search",
                 params={
                     "query": name,
                     "fields": "name,affiliations,paperCount,citationCount",
                 },
             )
-            response.raise_for_status()
             return list(response.json().get("data", []))
         except Exception as exc:
             logger.error("Author search failed for '%s': %s", name, exc)
@@ -94,11 +100,10 @@ class SemanticScholarClient:
             Paper dict (including ``paperId``) for the top match, or ``None``.
         """
         try:
-            response = self._client.get(
+            response = self._request(
                 f"{_BASE}/paper/search",
                 params={"query": title, "fields": _PAPER_FIELDS, "limit": 1},
             )
-            response.raise_for_status()
             data: list[dict[str, Any]] = response.json().get("data", [])
             return data[0] if data else None
         except Exception as exc:
@@ -156,6 +161,49 @@ class SemanticScholarClient:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _request(self, url: str, params: dict[str, Any]) -> httpx.Response:
+        """GET *url* with exponential back-off on retryable HTTP errors.
+
+        Retries on :data:`_RETRY_STATUSES` (429, 500–504) up to
+        :attr:`_max_retries` times, doubling the wait each attempt
+        (capped at 60 s) with ±10 % jitter.
+
+        Args:
+            url: Full endpoint URL.
+            params: Query parameters forwarded verbatim.
+
+        Returns:
+            Successful :class:`httpx.Response`.
+
+        Raises:
+            httpx.HTTPStatusError: Non-retryable error status, or all
+                retries exhausted on a retryable status.
+            httpx.RequestError: Network-level failure (not retried).
+        """
+        wait = self._backoff_base
+        resp: httpx.Response | None = None
+        for attempt in range(self._max_retries + 1):
+            resp = self._client.get(url, params=params)
+            if resp.status_code not in _RETRY_STATUSES:
+                resp.raise_for_status()
+                return resp
+            if attempt < self._max_retries:
+                jitter = random.uniform(-wait * 0.1, wait * 0.1)
+                delay = min(wait + jitter, 60.0)
+                logger.warning(
+                    "SS HTTP %d on %s; retrying in %.1fs (attempt %d/%d)",
+                    resp.status_code,
+                    url,
+                    delay,
+                    attempt + 1,
+                    self._max_retries,
+                )
+                time.sleep(delay)
+                wait = min(wait * 2, 60.0)
+        assert resp is not None  # loop always executes ≥ once
+        resp.raise_for_status()
+        return resp  # unreachable: raise_for_status() raises for 4xx/5xx
+
     def _paginate(self, url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Consume all pages from a paginated Semantic Scholar endpoint.
 
@@ -176,11 +224,10 @@ class SemanticScholarClient:
 
         while True:
             try:
-                response = self._client.get(
+                response = self._request(
                     url,
                     params={**params, "limit": _PAGE_SIZE, "offset": offset},
                 )
-                response.raise_for_status()
                 body: dict[str, Any] = response.json()
             except Exception as exc:
                 logger.error("SS API request to '%s' failed: %s", url, exc)
