@@ -1,10 +1,12 @@
 """Streamlit dashboard — AugmentedScholar Network Analysis Engine.
 
-Four tabs:
+Six tabs:
   * Citation Map   — interactive 3D citation network; click a node to open its DOI.
   * Papers         — reverse-chronological paper list with formatted citations.
   * Gap Analysis   — isolated nodes, missing PDFs, missing abstracts.
-  * Analytics      — centrality leaderboard table.
+  * Analytics      — centrality leaderboard table with clickable DOIs.
+  * Missing Papers — papers without PDFs, sorted by citation count.
+  * Semantic Map   — t-SNE clustering of paper abstracts.
 
 Launch::
 
@@ -19,6 +21,7 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 import argparse as _argparse
 import html as _html
+import json
 import re
 import sys
 from pathlib import Path
@@ -65,14 +68,132 @@ def _get_positions(mtime: float) -> dict[str, tuple[float, float, float]]:
     return compute_layout_3d(cg.graph)  # type: ignore[arg-type]
 
 
-def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
-    """Classify nodes into 'own', 'cited', and 'citing' sets.
+@st.cache_data(ttl=300)
+def _load_sidecar_texts(mtime: float) -> dict[str, str]:
+    """Single-pass load of abstract+keywords text from all JSON sidecars.
 
-    - **own**: tier-0 — the author's own papers.
-    - **cited**: reachable from own via ``"cites"`` edges (the author's references).
-    - **citing**: reachable from own via ``"is_cited_by"`` edges (papers that cite the
-      author).
+    Returns {doi: text}.  Much faster than load_paper_metadata per DOI
+    (O(n) total vs O(n²)).  Skips list-valued JSON files (missing_pdfs.json).
     """
+    _ = mtime  # cache key only
+    result: dict[str, str] = {}
+    for json_path in LIBRARY_DIR.glob("*.json"):
+        try:
+            data: Any = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or "title" not in data:
+            continue
+        doi = data.get("doi")
+        if not doi:
+            continue
+        abstract: str = data.get("abstract") or ""
+        keywords: list[str] = data.get("keywords") or []
+        text = abstract
+        if keywords:
+            text += " " + " ".join(str(k) for k in keywords)
+        text = text.strip()
+        if text:
+            result[doi] = text
+    return result
+
+
+@st.cache_data(ttl=300)
+def _compute_tsne_layout(
+    mtime: float,
+    k: int,
+) -> tuple[dict[str, tuple[float, float]], dict[str, int], dict[int, list[str]]]:
+    """TF-IDF + t-SNE + K-Means for all papers with abstracts.
+
+    Returns:
+        positions: {doi: (x, y)}
+        cluster_labels: {doi: cluster_id}  (-1 = no abstract text)
+        top_terms: {cluster_id: [term1, term2, term3]}
+    """
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.decomposition import PCA
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.manifold import TSNE
+
+    texts = _load_sidecar_texts(mtime)
+    cg, _ = _load_graph_builder()
+    graph_dois = list(cg.graph.nodes())  # type: ignore[union-attr]
+
+    dois_with_text = [d for d in graph_dois if d in texts]
+    dois_no_text = [d for d in graph_dois if d not in texts]
+
+    positions: dict[str, tuple[float, float]] = {}
+    cluster_labels: dict[str, int] = {}
+    top_terms: dict[int, list[str]] = {}
+
+    for doi in dois_no_text:
+        positions[doi] = (0.0, 0.0)
+        cluster_labels[doi] = -1
+
+    n = len(dois_with_text)
+    if n == 0:
+        return positions, cluster_labels, top_terms
+
+    if n == 1:
+        positions[dois_with_text[0]] = (0.0, 0.0)
+        cluster_labels[dois_with_text[0]] = 0
+        top_terms[0] = []
+        return positions, cluster_labels, top_terms
+
+    corpus = [texts[doi] for doi in dois_with_text]
+    vectorizer = TfidfVectorizer(max_features=500, stop_words="english", min_df=1)
+    X = vectorizer.fit_transform(corpus)
+    X_dense: np.ndarray = X.toarray()
+
+    if n >= 3:
+        perplexity = min(30.0, float(n - 1))
+        reducer = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            random_state=42,
+            n_iter=1000,
+            learning_rate="auto",
+            init="pca",
+        )
+        coords: np.ndarray = reducer.fit_transform(X_dense)
+    else:
+        n_components = min(2, n - 1)
+        pca = PCA(n_components=n_components, random_state=42)
+        reduced = pca.fit_transform(X_dense)
+        if n_components == 1:
+            coords = np.column_stack([reduced, np.zeros(n)])
+        else:
+            coords = reduced
+
+    effective_k = max(1, min(k, n))
+    km = KMeans(n_clusters=effective_k, random_state=42, n_init=10)
+    cluster_ids: np.ndarray = km.fit_predict(X_dense)
+
+    for i, doi in enumerate(dois_with_text):
+        positions[doi] = (float(coords[i, 0]), float(coords[i, 1]))
+        cluster_labels[doi] = int(cluster_ids[i])
+
+    feature_names = vectorizer.get_feature_names_out()
+    for cid in range(effective_k):
+        mask = cluster_ids == cid
+        if not mask.any():
+            top_terms[cid] = []
+            continue
+        centroid = X_dense[mask].mean(axis=0)
+        top_idx = centroid.argsort()[::-1][:3]
+        top_terms[cid] = [str(feature_names[i]) for i in top_idx]
+
+    return positions, cluster_labels, top_terms
+
+
+# ---------------------------------------------------------------------------
+# Graph helpers
+# ---------------------------------------------------------------------------
+
+
+def _classify_nodes(graph: nx.DiGraph) -> dict[str, set[str]]:
+    """Classify nodes into 'own', 'cited', and 'citing' sets."""
     own: set[str] = {n for n, d in graph.nodes(data=True) if d.get("tier", 1) == 0}
 
     cited: set[str] = set()
@@ -139,7 +260,6 @@ def _author_last_first(name: str) -> str:
 
 
 def _author_display(name: str) -> str:
-    """Return name with normalised whitespace."""
     return " ".join(name.strip().split())
 
 
@@ -151,7 +271,6 @@ def _bib_key(doi: str, authors: list[str], year: int | str | None) -> str:
 
 
 def _format_citation(doi: str, attrs: dict[str, Any], style: str) -> str:
-    """Return a formatted citation string for *style*."""
     title: str = attrs.get("title") or doi
     authors: list[str] = attrs.get("authors") or []
     year = attrs.get("year")
@@ -245,8 +364,118 @@ def _format_citation(doi: str, attrs: dict[str, Any], style: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Paper card
+# Visual helpers
 # ---------------------------------------------------------------------------
+
+
+def _inject_css() -> None:
+    """Inject dark-theme CSS to match the 3D visualisation palette."""
+    st.markdown(
+        """
+<style>
+/* ---- Page & sidebar ---- */
+.stApp { background-color: #0d0d0d; color: #e0e0e0; }
+section[data-testid="stSidebar"] { background-color: #111111; }
+
+/* ---- Tabs ---- */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 3px;
+    border-bottom: 1px solid #2a2a2a;
+    background-color: #0d0d0d;
+}
+.stTabs [data-baseweb="tab"] {
+    background-color: #1a1a1a;
+    border-radius: 6px 6px 0 0;
+    color: #999;
+    padding: 6px 20px;
+    font-size: 13px;
+    border: 1px solid #2a2a2a;
+    border-bottom: none;
+}
+.stTabs [aria-selected="true"] {
+    background-color: #1e3a5f !important;
+    color: #ffffff !important;
+    border-color: #2a5080 !important;
+}
+.stTabs [data-baseweb="tab"]:hover { color: #ddd; background-color: #222; }
+
+/* ---- Metrics ---- */
+[data-testid="stMetricValue"] { color: #5b9bd5; font-size: 1.6rem !important; }
+[data-testid="stMetricLabel"] { color: #888; }
+[data-testid="stMetricDelta"] { font-size: 0.85rem; }
+
+/* ---- Headings ---- */
+h1 { color: #ffffff; font-size: 1.5rem !important; }
+h2, h3 { color: #e0e0e0; }
+
+/* ---- DataFrames ---- */
+[data-testid="stDataFrame"] {
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+/* ---- Expanders ---- */
+[data-testid="stExpander"] summary {
+    background-color: #1a1a1a;
+    border-radius: 4px;
+    color: #ddd;
+}
+
+/* ---- Buttons ---- */
+.stButton > button {
+    background-color: #1e3a5f;
+    color: #fff;
+    border: 1px solid #2a5080;
+    border-radius: 4px;
+}
+.stButton > button:hover { background-color: #2a5080; }
+
+/* ---- Link buttons ---- */
+.stLinkButton a {
+    background-color: #1a2a3a !important;
+    color: #5b9bd5 !important;
+    border: 1px solid #2a4a6a !important;
+    border-radius: 4px !important;
+    font-size: 12px !important;
+    padding: 2px 10px !important;
+    text-decoration: none !important;
+}
+.stLinkButton a:hover { background-color: #1e3a5f !important; }
+
+/* ---- Captions ---- */
+.stCaption { color: #777 !important; font-size: 12px; }
+
+/* ---- Code blocks ---- */
+.stCode { background-color: #1a1a1a !important; }
+
+/* ---- Spinners ---- */
+[data-testid="stSpinner"] { color: #5b9bd5; }
+
+/* ---- Checkboxes ---- */
+.stCheckbox label { color: #ccc; font-size: 13px; }
+
+/* ---- Dividers ---- */
+hr { border-color: #2a2a2a; }
+</style>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_doi_list(dois: list[str], limit: int = 60) -> None:
+    """Render a 3-column grid of DOI link-buttons."""
+    subset = dois[:limit]
+    cols_per_row = 3
+    for i in range(0, len(subset), cols_per_row):
+        chunk = subset[i : i + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, doi in zip(cols, chunk, strict=False):
+            short = doi if len(doi) <= 34 else doi[:31] + "…"
+            col.link_button(
+                short, url=f"https://doi.org/{doi}", use_container_width=True
+            )
+    if len(dois) > limit:
+        st.caption(f"… and {len(dois) - limit} more")
 
 
 def _paper_card(doi: str) -> None:
@@ -276,7 +505,7 @@ def _paper_card(doi: str) -> None:
         if keywords:
             st.caption("Keywords: " + ", ".join(str(k) for k in keywords[:10]))
         if doi:
-            st.markdown(f"[Open DOI](https://doi.org/{doi})")
+            st.link_button("Open DOI ↗", f"https://doi.org/{doi}")
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +571,6 @@ def _tab_citation_map() -> None:
         st.warning("Graph is empty — run `run_expansion.py` first.")
         return
 
-    # ---- Category toggles (full-width row) --------------------------------
     classification = _classify_nodes(graph)
     n_own = len(classification["own"])
     n_cited = len(classification["cited"])
@@ -353,30 +581,21 @@ def _tab_citation_map() -> None:
     show_cited = c2.checkbox(f"Cited ({n_cited})", value=True, key="show_cited")
     show_citing = c3.checkbox(f"Citing ({n_citing})", value=True, key="show_citing")
 
-    # Papers shown in left panel (strictly from selected categories)
-    list_nodes: set[str] = set()
+    visible: set[str] = set()
     if show_own:
-        list_nodes |= classification["own"]
+        visible |= classification["own"]
     if show_cited:
-        list_nodes |= classification["cited"]
+        visible |= classification["cited"]
     if show_citing:
-        list_nodes |= classification["citing"]
+        visible |= classification["citing"]
 
-    # 3D plot also renders uncategorised nodes that don't belong to any set
     all_nodes: set[str] = set(graph.nodes())
-    uncategorised = all_nodes - (
-        classification["own"] | classification["cited"] | classification["citing"]
-    )
-    visible = list_nodes | uncategorised
-
-    # Current highlighted DOI (set by previous click interaction)
     selected_doi: str = st.session_state.get("_selected_doi", "")
 
-    # ---- Two-column layout: paper list | 3D plot --------------------------
     left, right = st.columns([1, 3], gap="small")
 
     with left:
-        _render_paper_list(graph, list_nodes, selected_doi)
+        _render_paper_list(graph, visible, selected_doi)
 
     with right:
         st.caption(f"{len(visible)}/{n_nodes} papers · {n_edges} citation edges")
@@ -386,7 +605,7 @@ def _tab_citation_map() -> None:
             for node in classification[cat_name]:
                 node_cat[node] = cat_name
 
-        filter_arg = visible if visible != all_nodes else None
+        filter_arg = None if visible == all_nodes else visible
         fig = _get_figure(filter_arg, node_categories=node_cat)
         event = st.plotly_chart(
             fig,
@@ -399,11 +618,9 @@ def _tab_citation_map() -> None:
         if points:
             doi = str(points[0].get("customdata", ""))
             if doi:
-                # Sync left-panel highlight — rerun so the list sees the new value
                 if doi != selected_doi:
                     st.session_state["_selected_doi"] = doi
                     st.rerun()
-                # Open DOI in a new browser tab (once per selection)
                 if doi != st.session_state.get("_last_doi_opened"):
                     st.session_state["_last_doi_opened"] = doi
                     import streamlit.components.v1 as components
@@ -463,7 +680,12 @@ def _tab_papers() -> None:
         st.code(all_bib, language="bibtex")
     else:
         for doi, attrs in rows:
-            st.markdown(_format_citation(doi, attrs, style))
+            col_text, col_link = st.columns([10, 1])
+            with col_text:
+                st.markdown(_format_citation(doi, attrs, style))
+            with col_link:
+                if doi:
+                    st.link_button("↗", f"https://doi.org/{doi}")
             st.divider()
 
 
@@ -485,17 +707,32 @@ def _tab_gap_analysis() -> None:
         import pandas as pd
 
         df = pd.DataFrame(report.high_centrality_no_pdf)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        if "doi" in df.columns:
+            df["doi_url"] = df["doi"].apply(
+                lambda d: f"https://doi.org/{d}" if d else ""
+            )
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=(
+                {
+                    "doi_url": st.column_config.LinkColumn(
+                        "Link", display_text="↗ open", width="small"
+                    )
+                }
+                if "doi_url" in df.columns
+                else None
+            ),
+        )
 
     if report.isolated_nodes:
         st.markdown("#### Isolated Nodes (no citation edges)")
-        for doi in report.isolated_nodes[:50]:
-            st.code(doi, language=None)
+        _render_doi_list(report.isolated_nodes)
 
     if report.no_abstract:
         st.markdown("#### Papers Missing Abstract")
-        for doi in report.no_abstract[:50]:
-            st.code(doi, language=None)
+        _render_doi_list(report.no_abstract)
 
 
 def _tab_analytics() -> None:
@@ -507,7 +744,7 @@ def _tab_analytics() -> None:
     for node, attrs in cg.graph.nodes(data=True):  # type: ignore[union-attr]
         rows.append(
             {
-                "doi": node,
+                "doi_url": f"https://doi.org/{node}" if node else "",
                 "title": attrs.get("title", node)[:80],
                 "year": attrs.get("year"),
                 "betweenness": round(attrs.get("betweenness", 0.0), 5),
@@ -520,7 +757,271 @@ def _tab_analytics() -> None:
         return
 
     df = pd.DataFrame(rows).sort_values("betweenness", ascending=False)
-    st.dataframe(df.head(100), use_container_width=True, hide_index=True)
+    st.dataframe(
+        df.head(100),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "doi_url": st.column_config.LinkColumn(
+                "DOI", display_text="↗ open", width="small"
+            )
+        },
+    )
+
+
+def _tab_missing_papers() -> None:
+    st.subheader("Papers Missing PDF")
+
+    manifest_path = LIBRARY_DIR / "missing_pdfs.json"
+    if not manifest_path.exists():
+        st.info("No `missing_pdfs.json` found — run `run_expansion.py` to generate it.")
+        return
+
+    try:
+        raw: list[dict[str, Any]] = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        st.error(f"Could not read manifest: {exc}")
+        return
+
+    # Join citation counts from in-memory graph
+    cg, _ = _load_graph_builder()
+    node_cc: dict[str, int] = {
+        n: d.get("citation_count", 0)
+        for n, d in cg.graph.nodes(data=True)  # type: ignore[union-attr]
+    }
+    for entry in raw:
+        entry["citations"] = node_cc.get(entry.get("doi", ""), 0)
+
+    raw.sort(key=lambda e: e.get("citations", 0), reverse=True)
+
+    import pandas as pd
+
+    rows_out = []
+    for e in raw:
+        authors: list[str] = e.get("authors") or []
+        author_str = authors[0] if authors else ""
+        if len(authors) > 1:
+            author_str += " et al."
+        rows_out.append(
+            {
+                "citations": e.get("citations", 0),
+                "year": e.get("year"),
+                "title": (e.get("title") or "")[:90],
+                "first_author": author_str,
+                "journal": (e.get("journal") or "")[:40],
+                "doi_url": e.get("doi_url") or "",
+            }
+        )
+
+    df = pd.DataFrame(rows_out)
+
+    c1, c2 = st.columns([1, 3])
+    c1.metric("Missing PDFs", len(df))
+    c2.info(
+        "Download papers from the DOI links, then run:\n\n"
+        "```\npython organize_downloads.py --apply\n```\n"
+        "to automatically match and move files from `~/Downloads` into the library."
+    )
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "doi_url": st.column_config.LinkColumn(
+                "DOI", display_text="↗ open", width="small"
+            ),
+            "citations": st.column_config.NumberColumn("Citations", format="%d"),
+            "year": st.column_config.NumberColumn("Year", format="%d"),
+        },
+    )
+
+
+def _build_semantic_figure(
+    graph: nx.DiGraph,
+    positions: dict[str, tuple[float, float]],
+    cluster_labels: dict[str, int],
+    top_terms: dict[int, list[str]],
+    visible_nodes: set[str] | None,
+) -> Any:
+    """Build a 2-D Plotly scatter figure coloured by semantic cluster."""
+    import plotly.express as px
+    import plotly.graph_objects as go
+
+    from src.viz_engine import node_size as _ns
+
+    nodes = [n for n in graph.nodes() if n in positions]
+    if visible_nodes is not None:
+        nodes = [n for n in nodes if n in visible_nodes]
+
+    if not nodes:
+        return go.Figure(
+            layout=go.Layout(
+                paper_bgcolor="#0a0a0a",
+                plot_bgcolor="#111111",
+                font={"color": "white"},
+            )
+        )
+
+    palette = px.colors.qualitative.Plotly
+    cluster_ids_present = sorted(set(cluster_labels.get(n, -1) for n in nodes))
+
+    traces: list[go.Scatter] = []
+    for cid in cluster_ids_present:
+        cat_nodes = [n for n in nodes if cluster_labels.get(n, -1) == cid]
+        if not cat_nodes:
+            continue
+
+        if cid == -1:
+            color = "#444444"
+            name = "No abstract"
+        else:
+            color = palette[cid % len(palette)]
+            terms = top_terms.get(cid, [])
+            name = f"Cluster {cid}: {', '.join(terms)}" if terms else f"Cluster {cid}"
+
+        xs = [positions[n][0] for n in cat_nodes]
+        ys = [positions[n][1] for n in cat_nodes]
+        sizes = [_ns(graph.nodes[n].get("citation_count", 0)) * 1.2 for n in cat_nodes]
+
+        hovers = []
+        for n in cat_nodes:
+            attrs = graph.nodes[n]
+            au: list[str] = attrs.get("authors") or []
+            first_a = au[0].split()[-1] if au else "?"
+            hovers.append(
+                f"<b>{_html.escape(str(attrs.get('title', n)))}</b><br>"
+                f"{_html.escape(first_a)} · {attrs.get('year', '?')}<br>"
+                f"{_html.escape(str(attrs.get('journal', '')))}<br>"
+                f"Citations: {attrs.get('citation_count', 0)}<br>"
+                f"<i>{_html.escape(name)}</i>"
+            )
+
+        traces.append(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker={
+                    "color": color,
+                    "size": sizes,
+                    "opacity": 0.82,
+                    "line": {"width": 0.5, "color": "rgba(255,255,255,0.15)"},
+                },
+                hovertext=hovers,
+                hoverinfo="text",
+                customdata=cat_nodes,
+                name=name,
+                showlegend=True,
+            )
+        )
+
+    return go.Figure(
+        data=traces,
+        layout=go.Layout(
+            paper_bgcolor="#0a0a0a",
+            plot_bgcolor="#111111",
+            font={"color": "white"},
+            margin={"l": 20, "r": 20, "b": 20, "t": 20},
+            xaxis={"visible": False, "showgrid": False},
+            yaxis={"visible": False, "showgrid": False},
+            showlegend=True,
+            legend={
+                "x": 1.01,
+                "y": 1.0,
+                "xanchor": "left",
+                "bgcolor": "rgba(10,10,10,0.8)",
+                "bordercolor": "#333",
+                "borderwidth": 1,
+                "font": {"size": 11},
+            },
+            uirevision="constant",
+        ),
+    )
+
+
+def _tab_semantic_map() -> None:
+    st.subheader("Semantic Map")
+    cg, _ = _load_graph_builder()
+    graph: nx.DiGraph = cg.graph  # type: ignore[assignment]
+
+    if graph.number_of_nodes() == 0:
+        st.warning("Graph is empty — run `run_expansion.py` first.")
+        return
+
+    classification = _classify_nodes(graph)
+    n_own = len(classification["own"])
+    n_cited = len(classification["cited"])
+    n_citing = len(classification["citing"])
+
+    c1, c2, c3, _, c5 = st.columns([2, 2, 2, 1, 4])
+    show_own = c1.checkbox(f"Own ({n_own})", value=True, key="sem_own")
+    show_cited = c2.checkbox(f"Cited ({n_cited})", value=True, key="sem_cited")
+    show_citing = c3.checkbox(f"Citing ({n_citing})", value=True, key="sem_citing")
+    k = int(c5.slider("Clusters (k)", min_value=2, max_value=20, value=6, key="sem_k"))
+
+    visible: set[str] = set()
+    if show_own:
+        visible |= classification["own"]
+    if show_cited:
+        visible |= classification["cited"]
+    if show_citing:
+        visible |= classification["citing"]
+
+    mtime = GRAPH_PATH.stat().st_mtime if GRAPH_PATH.exists() else 0.0
+
+    with st.spinner("Computing semantic layout (t-SNE)…"):
+        try:
+            positions, cluster_labels, top_terms = _compute_tsne_layout(mtime, k)
+        except ImportError:
+            st.error(
+                "scikit-learn is required for the Semantic Map. "
+                "Install it with: `uv pip install scikit-learn>=1.0`"
+            )
+            return
+
+    n_with_text = sum(1 for doi in graph.nodes() if cluster_labels.get(doi, -1) != -1)
+    eff_k = min(k, n_with_text)
+    st.caption(
+        f"{len(visible)}/{graph.number_of_nodes()} papers visible · "
+        f"{n_with_text} have abstracts · k={eff_k} effective clusters"
+    )
+
+    if n_with_text == 0:
+        st.warning(
+            "No papers have abstracts yet. "
+            "Run `run_expansion.py --enrich` to fetch them."
+        )
+        return
+
+    all_nodes: set[str] = set(graph.nodes())
+    filter_arg = None if visible == all_nodes else (visible or None)
+    fig = _build_semantic_figure(
+        graph, positions, cluster_labels, top_terms, filter_arg
+    )
+
+    event = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        on_select="rerun",
+        key="semantic_map",
+    )
+
+    points = getattr(getattr(event, "selection", None), "points", [])
+    if points:
+        doi = str(points[0].get("customdata", ""))
+        if doi:
+            if doi != st.session_state.get("_sem_last_doi_opened"):
+                st.session_state["_sem_last_doi_opened"] = doi
+                import streamlit.components.v1 as components
+
+                components.html(
+                    f'<script>window.open("https://doi.org/{doi}", "_blank");</script>',
+                    height=0,
+                )
+            _paper_card(doi)
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +1037,18 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    _inject_css()
     st.title("AugmentedScholar — Network Analysis")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Citation Map", "Papers", "Gap Analysis", "Analytics"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        [
+            "Citation Map",
+            "Papers",
+            "Gap Analysis",
+            "Analytics",
+            "Missing Papers",
+            "Semantic Map",
+        ]
     )
     with tab1:
         _tab_citation_map()
@@ -549,6 +1058,10 @@ def main() -> None:
         _tab_gap_analysis()
     with tab4:
         _tab_analytics()
+    with tab5:
+        _tab_missing_papers()
+    with tab6:
+        _tab_semantic_map()
 
 
 if __name__ == "__main__" or "streamlit" in sys.modules:

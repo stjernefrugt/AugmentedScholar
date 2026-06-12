@@ -149,7 +149,7 @@ def compute_layout_3d(
     return {node: (float(v[0]), float(v[1]), float(v[2])) for node, v in raw.items()}
 
 
-def _node_size(citation_count: int) -> float:
+def node_size(citation_count: int) -> float:
     """Log-scaled node size clamped to [_NODE_MIN_SIZE, _NODE_MAX_SIZE]."""
     raw = _NODE_MIN_SIZE + 6 * math.log10(citation_count + 1)
     return max(_NODE_MIN_SIZE, min(_NODE_MAX_SIZE, raw))
@@ -231,7 +231,7 @@ def build_plotly_3d(
         style = _CATEGORY_STYLE[cat]
         years = [graph.nodes[n].get("year", _YEAR_MIN) for n in cat_nodes]
         sizes = [
-            _node_size(graph.nodes[n].get("citation_count", 0)) * style["size_scale"]
+            node_size(graph.nodes[n].get("citation_count", 0)) * style["size_scale"]
             for n in cat_nodes
         ]
         labels: list[str] = []

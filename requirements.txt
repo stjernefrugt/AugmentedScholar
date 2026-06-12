@@ -16,3 +16,6 @@ scholarly>=1.7
 plotly>=5.0
 streamlit>=1.33
 pandas>=2.0
+
+# Semantic Map: TF-IDF, t-SNE, K-Means (optional — only needed for Semantic Map tab)
+scikit-learn>=1.0
